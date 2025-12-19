@@ -2,37 +2,114 @@ import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import Border, Side, PatternFill, Font
+import glob
+import os
 
-file_path = '매출상세내역 목록_20251207_final_analyzed_v2.xlsx'
-output_file_path = '매출상세내역 목록_20251207_final_analyzed_v3.xlsx'
-source_sheet = '매출정리'
+# 매출상세내역 목록으로 시작하는 파일 자동 검색 (analyzed 파일 제외)
+file_pattern = '매출상세내역 목록*.xlsx'
+matching_files = glob.glob(file_pattern)
+
+# analyzed 파일 제외
+matching_files = [f for f in matching_files if '_analyzed' not in f]
+
+if not matching_files:
+    raise FileNotFoundError(f"'{file_pattern}' 패턴과 일치하는 파일을 찾을 수 없습니다.")
+
+# 가장 최근에 수정된 파일 선택
+file_path = max(matching_files, key=os.path.getmtime)
+print(f"사용할 파일: {file_path}")
+
+# 출력 파일명 생성 (원본 파일명 기반)
+base_name = os.path.splitext(file_path)[0]
+output_file_path = f"{base_name}_analyzed.xlsx"
+
+# 시트 이름 자동 확인
+wb_temp = openpyxl.load_workbook(file_path)
+available_sheets = wb_temp.sheetnames
+wb_temp.close()
+
+# 가능한 시트 이름 목록 (우선순위 순)
+possible_sheet_names = ['매출정리', '상세 빌 목록', 'Sheet1']
+source_sheet = None
+
+for sheet_name in possible_sheet_names:
+    if sheet_name in available_sheets:
+        source_sheet = sheet_name
+        break
+
+if source_sheet is None:
+    source_sheet = available_sheets[0]  # 첫 번째 시트 사용
+
+print(f"사용할 시트: {source_sheet}")
 
 try:
     # Load the source data
     df = pd.read_excel(file_path, sheet_name=source_sheet)
     
-    # Remove the '합계' row if it exists
-    # The previous script added a row where '객실' == '합계'
+    # 컬럼명 매핑 (다양한 파일 형식 지원)
+    column_mapping = {
+        '객실/단체ID': '객실',
+        '객실/단체 ID': '객실'
+    }
+    
+    # 컬럼명 변경
+    df.rename(columns=column_mapping, inplace=True)
+    
+    # '객실' 컬럼이 없으면 에러
+    if '객실' not in df.columns:
+        available_cols = ', '.join(df.columns.tolist())
+        raise ValueError(f"'객실' 또는 '객실/단체ID' 컬럼을 찾을 수 없습니다. 사용 가능한 컬럼: {available_cols}")
+    
+    # Remove the '합계' and '소계' rows if they exist
+    # Filter out summary rows that don't represent actual room numbers
     df = df[df['객실'] != '합계']
+    df = df[df['객실'] != '소계']
+    
+    # Remove rows where 객실 is NaN or empty
+    df = df[df['객실'].notna()]
+    df = df[df['객실'].astype(str).str.strip() != '']
+    
+    # Keep only rows where 객실 looks like a room number (starts with digits)
+    df = df[df['객실'].astype(str).str.match(r'^\d', na=False)]
     
     # Ensure numeric columns are numbers
     numeric_cols = ['객실료', '부가세', '총금액']
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     # Convert '일자' to datetime and extract Month
-    df['일자'] = pd.to_datetime(df['일자'])
+    df['일자'] = pd.to_datetime(df['일자'], errors='coerce')
+    # Remove rows where date conversion failed or is NaT
+    df = df.dropna(subset=['일자'])
     df['월'] = df['일자'].dt.strftime('%Y-%m')
 
     # 1. Monthly Sales
     monthly_sales = df.groupby('월')[numeric_cols].sum().reset_index()
+    # Add total row for monthly sales
+    total_row = pd.DataFrame([['합계'] + [monthly_sales[col].sum() for col in numeric_cols]], 
+                             columns=['월'] + numeric_cols)
+    monthly_sales = pd.concat([monthly_sales, total_row], ignore_index=True)
     
     # 2. Room Sales
     room_sales = df.groupby('객실')[numeric_cols].sum().reset_index()
+    # Add total row for room sales
+    total_row = pd.DataFrame([['합계'] + [room_sales[col].sum() for col in numeric_cols]], 
+                             columns=['객실'] + numeric_cols)
+    room_sales = pd.concat([room_sales, total_row], ignore_index=True)
     
     # 3. Monthly & Room Sales (Pivot)
     # Using pivot_table to show Rooms as rows and Months as columns for Total Amount
     monthly_room_sales = df.pivot_table(index='객실', columns='월', values='총금액', aggfunc='sum', fill_value=0).reset_index()
+    
+    # Add row total (sum across all months for each room) - 마지막 열에 합계
+    month_cols = [col for col in monthly_room_sales.columns if col != '객실']
+    monthly_room_sales['합계'] = monthly_room_sales[month_cols].sum(axis=1)
+    
+    # Add column total (sum for each month across all rooms) - 마지막 행에 합계
+    total_row_data = ['합계'] + [monthly_room_sales[col].sum() for col in month_cols] + [monthly_room_sales['합계'].sum()]
+    total_row = pd.DataFrame([total_row_data], columns=monthly_room_sales.columns)
+    monthly_room_sales = pd.concat([monthly_room_sales, total_row], ignore_index=True)
 
     # 4. Daily Occupancy & Room Type Stats
     room_mapping = {
@@ -191,12 +268,22 @@ try:
     print(f"Created sheet '{sheet_name_new}'.")
 
     # Formatting function
-    def apply_styles(ws):
+    def apply_styles(ws, sheet_type='default'):
         thin_border = Border(left=Side(style='thin'), 
                              right=Side(style='thin'), 
                              top=Side(style='thin'), 
                              bottom=Side(style='thin'))
         comma_format = '#,##0'
+        
+        # For simple sales sheets (월별매출, 룸별매출, 월별_룸별매출)
+        if sheet_type == 'sales':
+            for row in ws.iter_rows(min_row=1):
+                for cell in row:
+                    cell.border = thin_border
+                    # Apply comma format to numeric values
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = comma_format
+            return
         
         # Define fills for conditional formatting
         yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
@@ -275,9 +362,9 @@ try:
                         cell.font = red_bold_font
 
     # Apply styles to new sheets
-    if '월별매출' in wb.sheetnames: apply_styles(wb['월별매출'])
-    if '룸별매출' in wb.sheetnames: apply_styles(wb['룸별매출'])
-    if '월별_룸별매출' in wb.sheetnames: apply_styles(wb['월별_룸별매출'])
+    if '월별매출' in wb.sheetnames: apply_styles(wb['월별매출'], sheet_type='sales')
+    if '룸별매출' in wb.sheetnames: apply_styles(wb['룸별매출'], sheet_type='sales')
+    if '월별_룸별매출' in wb.sheetnames: apply_styles(wb['월별_룸별매출'], sheet_type='sales')
     if '점유율_및_평균단가' in wb.sheetnames: apply_styles(wb['점유율_및_평균단가'])
 
     wb.save(output_file_path)
